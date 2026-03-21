@@ -1,3 +1,6 @@
+https://ko-fi.com/gitdigitalzeroknowledge/goal?g=0
+
+
 https://buy.polar.sh/polar_cl_RF40qWYgiCob4z80EjoLU39XP2mxzRvTA6jAe0XIJo8
 
 <a href="https://buy.polar.sh/polar_cl_RF40qWYgiCob4z80EjoLU39XP2mxzRvTA6jAe0XIJo8" data-polar-checkout data-polar-checkout-theme="dark">Purchase</a>
