@@ -1,3 +1,9 @@
+
+
+<a href="https://buy.polar.sh/polar_cl_RF40qWYgiCob4z80EjoLU39XP2mxzRvTA6jAe0XIJo8" data-polar-checkout data-polar-checkout-theme="dark">Purchase</a>
+
+<script src="https://cdn.jsdelivr.net/npm/@polar-sh/checkout@0.1/dist/embed.global.js" defer data-auto-init></script>
+
 # Richards Credit Authority (RCA)
 > **The Definitive Source of Truth for Lending Governance, Compliance, and Risk Management.**
 
