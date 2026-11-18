@@ -4,6 +4,8 @@
 [![KYC/AML](https://img.shields.io/badge/Compliance-KYC%2FAML-red?style=for-the-badge)](https://github.com/Gitdigital-products/Identity-Verification-KYC-AML
 
 To structure GitDigital-Solana/credit-authority as an institutional-grade Solana Anchor program, the layout needs clean separation between Open Core primitives (on-chain state, Token-2022 Transfer Hook execution, and basic RBAC) and Enterprise extensions (automated tax-withholding splits, multi-jurisdiction policy engines, and zkPoT-OCC proof verification).
+
+
 1. Workspace Directory Layout
 Organize the repository as a standard Anchor workspace so external auditors, Solana Foundation grant reviewers, and enterprise integrators can immediately navigate the program logic, client SDK, and test suites.
 
