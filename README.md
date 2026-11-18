@@ -6,6 +6,8 @@
 To structure GitDigital-Solana/credit-authority as an institutional-grade Solana Anchor program, the layout needs clean separation between Open Core primitives (on-chain state, Token-2022 Transfer Hook execution, and basic RBAC) and Enterprise extensions (automated tax-withholding splits, multi-jurisdiction policy engines, and zkPoT-OCC proof verification).
 1. Workspace Directory Layout
 Organize the repository as a standard Anchor workspace so external auditors, Solana Foundation grant reviewers, and enterprise integrators can immediately navigate the program logic, client SDK, and test suites.
+
+
 credit-authority/
 ├── Anchor.toml
 ├── Cargo.toml                  # Workspace root (shared dependencies & release profiles)
@@ -33,6 +35,8 @@ credit-authority/
 │               └── verify_zk_attestation.rs # Hook into zkPoT-OCC verifier
 ├── sdk/                        # TypeScript / Rust client bindings (Open Core)
 └── tests/                      # Bankrun / LiteSVM deterministic integration tests
+
+
 
 2. Core On-Chain State (src/state/)
 Using InitSpace and explicit byte alignment keeps account rent deterministic and avoids serialization bugs during upgrades.
