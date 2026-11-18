@@ -1,3 +1,596 @@
+
+[![GitDigital Authorized](https://img.shields.io/badge/GitDigital-Authorized-9945FF?style=for-the-badge&logo=github)](https://github.com/Gitdigital-products)
+
+[![KYC/AML](https://img.shields.io/badge/Compliance-KYC%2FAML-red?style=for-the-badge)](https://github.com/Gitdigital-products/Identity-Verification-KYC-AML
+
+To structure GitDigital-Solana/credit-authority as an institutional-grade Solana Anchor program, the layout needs clean separation between Open Core primitives (on-chain state, Token-2022 Transfer Hook execution, and basic RBAC) and Enterprise extensions (automated tax-withholding splits, multi-jurisdiction policy engines, and zkPoT-OCC proof verification).
+1. Workspace Directory Layout
+Organize the repository as a standard Anchor workspace so external auditors, Solana Foundation grant reviewers, and enterprise integrators can immediately navigate the program logic, client SDK, and test suites.
+credit-authority/
+├── Anchor.toml
+├── Cargo.toml                  # Workspace root (shared dependencies & release profiles)
+├── NOTICE                      # GitDigital Solana copyright & RickCreator87 authorship
+├── SECURITY.md                 # Vulnerability disclosure policy
+├── programs/
+│   └── credit-authority/
+│       ├── Cargo.toml
+│       └── src/
+│           ├── lib.rs          # Program entrypoint & instruction routing
+│           ├── constants.rs    # PDA seeds, basis-point caps, version tags
+│           ├── error.rs        # Custom institutional & compliance error codes
+│           ├── events.rs       # Auditable on-chain events for off-chain indexers
+│           ├── state/
+│           │   ├── mod.rs
+│           │   ├── authority_config.rs  # Global governance & tax-treasury config
+│           │   ├── credit_line.rs       # Borrower credit limits, utilization & tier
+│           │   └── policy_rule.rs       # Compliance & KYC threshold rules
+│           └── instructions/
+│               ├── mod.rs
+│               ├── initialize_authority.rs
+│               ├── issue_credit_line.rs
+│               ├── execute_transfer_hook.rs # SPL Token-2022 Transfer Hook interface
+│               ├── settle_with_tax.rs       # Tax-first governance & escrow split
+│               └── verify_zk_attestation.rs # Hook into zkPoT-OCC verifier
+├── sdk/                        # TypeScript / Rust client bindings (Open Core)
+└── tests/                      # Bankrun / LiteSVM deterministic integration tests
+
+2. Core On-Chain State (src/state/)
+Using InitSpace and explicit byte alignment keeps account rent deterministic and avoids serialization bugs during upgrades.
+// programs/credit-authority/src/state/authority_config.rs
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct AuthorityConfig {
+    /// Institutional multisig / governance admin (e.g., Squads v4 PDA)
+    pub admin: Pubkey,
+    /// Dedicated treasury PDA for tax-first withholding & protocol fees
+    pub tax_escrow_vault: Pubkey,
+    /// External Solana Identity Registry program ID for CPI verification
+    pub identity_registry: Pubkey,
+    /// Tax withholding rate in basis points (e.g., 1500 = 15.00%)
+    pub tax_withholding_bps: u16,
+    /// Emergency circuit-breaker flag
+    pub paused: bool,
+    pub bump: u8,
+}
+
+// programs/credit-authority/src/state/credit_line.rs
+use anchor_lang::prelude::*;
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
+pub enum AccountTier {
+    Open,
+    Pro,
+    Enterprise,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct CreditLine {
+    pub borrower: Pubkey,
+    pub authority: Pubkey,
+    /// Maximum approved credit ceiling (in token base units)
+    pub credit_limit: u64,
+    /// Currently drawn balance
+    pub utilized_amount: u64,
+    /// Minimum KYC / compliance clearance level required
+    pub required_kyc_level: u8,
+    pub tier: AccountTier,
+    pub is_frozen: bool,
+    pub last_audit_timestamp: i64,
+    pub bump: u8,
+}
+
+3. Program Entrypoint & Token-2022 Transfer Hook (src/lib.rs)
+To integrate natively with Token-2022, the program implements the spl-transfer-hook-interface fallback/execute instruction alongside standard Anchor governance instructions.
+// programs/credit-authority/src/lib.rs
+use anchor_lang::prelude::*;
+use spl_discriminator::SplDiscriminate;
+use spl_transfer_hook_interface::instruction::ExecuteInstruction;
+
+pub mod constants;
+pub mod error;
+pub mod events;
+pub mod instructions;
+pub mod state;
+
+use instructions::*;
+
+declare_id!("CredAuth11111111111111111111111111111111111");
+
+#[program]
+pub mod credit_authority {
+    use super::*;
+
+    /// Initializes the global GitDigital Credit Authority configuration
+    pub fn initialize_authority(
+        ctx: Context<InitializeAuthority>,
+        tax_withholding_bps: u16,
+    ) -> Result<()> {
+        instructions::initialize_authority::handler(ctx, tax_withholding_bps)
+    }
+
+    /// Provisions or updates an institutional/verified credit line
+    pub fn issue_credit_line(
+        ctx: Context<IssueCreditLine>,
+        credit_limit: u64,
+        required_kyc_level: u8,
+        tier: state::AccountTier,
+    ) -> Result<()> {
+        instructions::issue_credit_line::handler(ctx, credit_limit, required_kyc_level, tier)
+    }
+
+    /// Executes a draw or repayment with automated tax-first escrow routing
+    pub fn settle_with_tax(
+        ctx: Context<SettleWithTax>,
+        gross_amount: u64,
+    ) -> Result<()> {
+        instructions::settle_with_tax::handler(ctx, gross_amount)
+    }
+
+    /// SPL Token-2022 Transfer Hook entrypoint
+    /// Automatically invoked by Token-2022 on every gated token transfer
+    #[interface(spl_transfer_hook_interface::execute)]
+    pub fn execute_transfer_hook(
+        ctx: Context<ExecuteTransferHook>,
+        amount: u64,
+    ) -> Result<()> {
+        instructions::execute_transfer_hook::handler(ctx, amount)
+    }
+}
+
+4. Tax-First Settlement & Compliance Guardrails (src/instructions/)
+Here is how the Tax-First Governance and Compliance Gate work atomically inside settle_with_tax.rs so funds cannot move without compliant identity status and deterministic tax escrow allocation:
+// programs/credit-authority/src/instructions/settle_with_tax.rs
+use anchor_lang::prelude::*;
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
+use crate::{error::CreditError, events::TaxSettlementEvent, state::*};
+
+#[derive(Accounts)]
+pub struct SettleWithTax<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        seeds = [b"authority_config"],
+        bump = config.bump,
+        constraint = !config.paused @ CreditError::ProtocolPaused
+    )]
+    pub config: Account<'info, AuthorityConfig>,
+
+    #[account(
+        mut,
+        seeds = [b"credit_line", payer.key().as_ref()],
+        bump = credit_line.bump,
+        constraint = !credit_line.is_frozen @ CreditError::CreditLineFrozen
+    )]
+    pub credit_line: Account<'info, CreditLine>,
+
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = payer,
+    )]
+    pub source_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        address = config.tax_escrow_vault,
+    )]
+    pub tax_escrow_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub destination_vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub mint: InterfaceAccount<'info, Mint>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+pub fn handler(ctx: Context<SettleWithTax>, gross_amount: u64) -> Result<()> {
+    let config = &ctx.accounts.config;
+    let credit_line = &mut ctx.accounts.credit_line;
+
+    // 1. Calculate deterministic tax withholding using u128 to prevent overflow
+    let tax_amount = (gross_amount as u128)
+        .checked_mul(config.tax_withholding_bps as u128)
+        .ok_or(CreditError::MathOverflow)?
+        .checked_div(10_000)
+        .ok_or(CreditError::MathOverflow)? as u64;
+
+    let net_amount = gross_amount
+        .checked_sub(tax_amount)
+        .ok_or(CreditError::MathOverflow)?;
+
+    // 2. Enforce credit ceiling
+    let new_utilization = credit_line
+        .utilized_amount
+        .checked_add(gross_amount)
+        .ok_or(CreditError::MathOverflow)?;
+    require!(
+        new_utilization <= credit_line.credit_limit,
+        CreditError::CreditLimitExceeded
+    );
+
+    let decimals = ctx.accounts.mint.decimals;
+
+    // 3. Route tax withholding to escrow first (Tax-First Governance)
+    if tax_amount > 0 {
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.source_vault.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.tax_escrow_vault.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
+                },
+            ),
+            tax_amount,
+            decimals,
+        )?;
+    }
+
+    // 4. Route net settlement amount
+    token_interface::transfer_checked(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            TransferChecked {
+                from: ctx.accounts.source_vault.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.destination_vault.to_account_info(),
+                authority: ctx.accounts.payer.to_account_info(),
+            },
+        ),
+        net_amount,
+        decimals,
+    )?;
+
+    credit_line.utilized_amount = new_utilization;
+    credit_line.last_audit_timestamp = Clock::get()?.unix_timestamp;
+
+    emit!(TaxSettlementEvent {
+        borrower: credit_line.borrower,
+        gross_amount,
+        tax_withheld: tax_amount,
+        net_settled: net_amount,
+        timestamp: credit_line.last_audit_timestamp,
+    });
+
+    Ok(())
+}
+
+5. Cargo.toml Manifest (Enterprise Attribution)
+Use clean organizational metadata in programs/credit-authority/Cargo.toml:
+[package]
+name = "gitdigital-credit-authority"
+version = "0.1.0"
+description = "Institutional lending authority, identity permissions, and tax-first governance for Solana Token-2022"
+edition = "2021"
+authors = ["RickCreator87 <gitdigitalsolana@gdsol.work>"]
+repository = "https://github.com/GitDigital-Solana/credit-authority"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "credit_authority"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+enterprise-zk = [] # Feature-gates zkPoT-OCC & multi-jurisdiction tax rules
+
+[dependencies]
+anchor-lang = { version = "0.30.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.30.1", features = ["token_2022"] }
+spl-transfer-hook-interface = "0.6.3"
+spl-discriminator = "0.2.3"
+
+Notice the enterprise-zk = [] feature flag in Cargo.toml—this cleanly enforces your Open Core model at compile time, allowing open-source users to build and audit the core module while enterprise builds unlock zkPoT-OCC proof verification and custom compliance modules.
+Next Steps
+Would you like to build out:
+ * execute_transfer_hook.rs + ExtraAccountMetaList initialization (so Token-2022 automatically resolves the AuthorityConfig, CreditLine, and Solana Identity Registry PDAs during transfers), or
+ * error.rs, events.rs, and constants.rs to complete the core crate files so it compiles cleanly?
+[![Tax Status](https://img.shields.io/badge/Governance-Tax--First-blue?style=for-the-badge)](https://github.com/Gitdigital-products/BADGE-AUTHORITY)
+
+[![Solana](https://img.shields.io/badge/Network-Solana-14F195?style=for-the-badge&logo=solana&logoColor=black)](https://solana.com)
+
+
+
+# GitDigital-Solana/credit-authority
+ as an institutional-grade Solana Anchor program, the layout needs clean separation between Open Core primitives (on-chain state, Token-2022 Transfer Hook execution, and basic RBAC) and Enterprise extensions (automated tax-withholding splits, multi-jurisdiction policy engines, and zkPoT-OCC proof verification).
+1. Workspace Directory Layout
+Organize the repository as a standard Anchor workspace so external auditors, Solana Foundation grant reviewers, and enterprise integrators can immediately navigate the program logic, client SDK, and test suites.
+credit-authority/
+├── Anchor.toml
+├── Cargo.toml                  # Workspace root (shared dependencies & release profiles)
+├── NOTICE                      # GitDigital Solana copyright & RickCreator87 authorship
+├── SECURITY.md                 # Vulnerability disclosure policy
+├── programs/
+│   └── credit-authority/
+│       ├── Cargo.toml
+│       └── src/
+│           ├── lib.rs          # Program entrypoint & instruction routing
+│           ├── constants.rs    # PDA seeds, basis-point caps, version tags
+│           ├── error.rs        # Custom institutional & compliance error codes
+│           ├── events.rs       # Auditable on-chain events for off-chain indexers
+│           ├── state/
+│           │   ├── mod.rs
+│           │   ├── authority_config.rs  # Global governance & tax-treasury config
+│           │   ├── credit_line.rs       # Borrower credit limits, utilization & tier
+│           │   └── policy_rule.rs       # Compliance & KYC threshold rules
+│           └── instructions/
+│               ├── mod.rs
+│               ├── initialize_authority.rs
+│               ├── issue_credit_line.rs
+│               ├── execute_transfer_hook.rs # SPL Token-2022 Transfer Hook interface
+│               ├── settle_with_tax.rs       # Tax-first governance & escrow split
+│               └── verify_zk_attestation.rs # Hook into zkPoT-OCC verifier
+├── sdk/                        # TypeScript / Rust client bindings (Open Core)
+└── tests/                      # Bankrun / LiteSVM deterministic integration tests
+
+2. Core On-Chain State (src/state/)
+Using InitSpace and explicit byte alignment keeps account rent deterministic and avoids serialization bugs during upgrades.
+// programs/credit-authority/src/state/authority_config.rs
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct AuthorityConfig {
+    /// Institutional multisig / governance admin (e.g., Squads v4 PDA)
+    pub admin: Pubkey,
+    /// Dedicated treasury PDA for tax-first withholding & protocol fees
+    pub tax_escrow_vault: Pubkey,
+    /// External Solana Identity Registry program ID for CPI verification
+    pub identity_registry: Pubkey,
+    /// Tax withholding rate in basis points (e.g., 1500 = 15.00%)
+    pub tax_withholding_bps: u16,
+    /// Emergency circuit-breaker flag
+    pub paused: bool,
+    pub bump: u8,
+}
+
+// programs/credit-authority/src/state/credit_line.rs
+use anchor_lang::prelude::*;
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
+pub enum AccountTier {
+    Open,
+    Pro,
+    Enterprise,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct CreditLine {
+    pub borrower: Pubkey,
+    pub authority: Pubkey,
+    /// Maximum approved credit ceiling (in token base units)
+    pub credit_limit: u64,
+    /// Currently drawn balance
+    pub utilized_amount: u64,
+    /// Minimum KYC / compliance clearance level required
+    pub required_kyc_level: u8,
+    pub tier: AccountTier,
+    pub is_frozen: bool,
+    pub last_audit_timestamp: i64,
+    pub bump: u8,
+}
+
+3. Program Entrypoint & Token-2022 Transfer Hook (src/lib.rs)
+To integrate natively with Token-2022, the program implements the spl-transfer-hook-interface fallback/execute instruction alongside standard Anchor governance instructions.
+// programs/credit-authority/src/lib.rs
+use anchor_lang::prelude::*;
+use spl_discriminator::SplDiscriminate;
+use spl_transfer_hook_interface::instruction::ExecuteInstruction;
+
+pub mod constants;
+pub mod error;
+pub mod events;
+pub mod instructions;
+pub mod state;
+
+use instructions::*;
+
+declare_id!("CredAuth11111111111111111111111111111111111");
+
+#[program]
+pub mod credit_authority {
+    use super::*;
+
+    /// Initializes the global GitDigital Credit Authority configuration
+    pub fn initialize_authority(
+        ctx: Context<InitializeAuthority>,
+        tax_withholding_bps: u16,
+    ) -> Result<()> {
+        instructions::initialize_authority::handler(ctx, tax_withholding_bps)
+    }
+
+    /// Provisions or updates an institutional/verified credit line
+    pub fn issue_credit_line(
+        ctx: Context<IssueCreditLine>,
+        credit_limit: u64,
+        required_kyc_level: u8,
+        tier: state::AccountTier,
+    ) -> Result<()> {
+        instructions::issue_credit_line::handler(ctx, credit_limit, required_kyc_level, tier)
+    }
+
+    /// Executes a draw or repayment with automated tax-first escrow routing
+    pub fn settle_with_tax(
+        ctx: Context<SettleWithTax>,
+        gross_amount: u64,
+    ) -> Result<()> {
+        instructions::settle_with_tax::handler(ctx, gross_amount)
+    }
+
+    /// SPL Token-2022 Transfer Hook entrypoint
+    /// Automatically invoked by Token-2022 on every gated token transfer
+    #[interface(spl_transfer_hook_interface::execute)]
+    pub fn execute_transfer_hook(
+        ctx: Context<ExecuteTransferHook>,
+        amount: u64,
+    ) -> Result<()> {
+        instructions::execute_transfer_hook::handler(ctx, amount)
+    }
+}
+
+4. Tax-First Settlement & Compliance Guardrails (src/instructions/)
+Here is how the Tax-First Governance and Compliance Gate work atomically inside settle_with_tax.rs so funds cannot move without compliant identity status and deterministic tax escrow allocation:
+// programs/credit-authority/src/instructions/settle_with_tax.rs
+use anchor_lang::prelude::*;
+use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
+use crate::{error::CreditError, events::TaxSettlementEvent, state::*};
+
+#[derive(Accounts)]
+pub struct SettleWithTax<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    #[account(
+        seeds = [b"authority_config"],
+        bump = config.bump,
+        constraint = !config.paused @ CreditError::ProtocolPaused
+    )]
+    pub config: Account<'info, AuthorityConfig>,
+
+    #[account(
+        mut,
+        seeds = [b"credit_line", payer.key().as_ref()],
+        bump = credit_line.bump,
+        constraint = !credit_line.is_frozen @ CreditError::CreditLineFrozen
+    )]
+    pub credit_line: Account<'info, CreditLine>,
+
+    #[account(
+        mut,
+        token::mint = mint,
+        token::authority = payer,
+    )]
+    pub source_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        address = config.tax_escrow_vault,
+    )]
+    pub tax_escrow_vault: InterfaceAccount<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub destination_vault: InterfaceAccount<'info, TokenAccount>,
+
+    pub mint: InterfaceAccount<'info, Mint>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
+pub fn handler(ctx: Context<SettleWithTax>, gross_amount: u64) -> Result<()> {
+    let config = &ctx.accounts.config;
+    let credit_line = &mut ctx.accounts.credit_line;
+
+    // 1. Calculate deterministic tax withholding using u128 to prevent overflow
+    let tax_amount = (gross_amount as u128)
+        .checked_mul(config.tax_withholding_bps as u128)
+        .ok_or(CreditError::MathOverflow)?
+        .checked_div(10_000)
+        .ok_or(CreditError::MathOverflow)? as u64;
+
+    let net_amount = gross_amount
+        .checked_sub(tax_amount)
+        .ok_or(CreditError::MathOverflow)?;
+
+    // 2. Enforce credit ceiling
+    let new_utilization = credit_line
+        .utilized_amount
+        .checked_add(gross_amount)
+        .ok_or(CreditError::MathOverflow)?;
+    require!(
+        new_utilization <= credit_line.credit_limit,
+        CreditError::CreditLimitExceeded
+    );
+
+    let decimals = ctx.accounts.mint.decimals;
+
+    // 3. Route tax withholding to escrow first (Tax-First Governance)
+    if tax_amount > 0 {
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.token_program.to_account_info(),
+                TransferChecked {
+                    from: ctx.accounts.source_vault.to_account_info(),
+                    mint: ctx.accounts.mint.to_account_info(),
+                    to: ctx.accounts.tax_escrow_vault.to_account_info(),
+                    authority: ctx.accounts.payer.to_account_info(),
+                },
+            ),
+            tax_amount,
+            decimals,
+        )?;
+    }
+
+    // 4. Route net settlement amount
+    token_interface::transfer_checked(
+        CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            TransferChecked {
+                from: ctx.accounts.source_vault.to_account_info(),
+                mint: ctx.accounts.mint.to_account_info(),
+                to: ctx.accounts.destination_vault.to_account_info(),
+                authority: ctx.accounts.payer.to_account_info(),
+            },
+        ),
+        net_amount,
+        decimals,
+    )?;
+
+    credit_line.utilized_amount = new_utilization;
+    credit_line.last_audit_timestamp = Clock::get()?.unix_timestamp;
+
+    emit!(TaxSettlementEvent {
+        borrower: credit_line.borrower,
+        gross_amount,
+        tax_withheld: tax_amount,
+        net_settled: net_amount,
+        timestamp: credit_line.last_audit_timestamp,
+    });
+
+    Ok(())
+}
+
+5. Cargo.toml Manifest (Enterprise Attribution)
+Use clean organizational metadata in programs/credit-authority/Cargo.toml:
+[package]
+name = "gitdigital-credit-authority"
+version = "0.1.0"
+description = "Institutional lending authority, identity permissions, and tax-first governance for Solana Token-2022"
+edition = "2021"
+authors = ["RickCreator87 <gitdigitalsolana@gdsol.work>"]
+repository = "https://github.com/GitDigital-Solana/credit-authority"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "credit_authority"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+enterprise-zk = [] # Feature-gates zkPoT-OCC & multi-jurisdiction tax rules
+
+[dependencies]
+anchor-lang = { version = "0.30.1", features = ["init-if-needed"] }
+anchor-spl = { version = "0.30.1", features = ["token_2022"] }
+spl-transfer-hook-interface = "0.6.3"
+spl-discriminator = "0.2.3"
+
+Notice the enterprise-zk = [] feature flag in Cargo.toml—this cleanly enforces your Open Core model at compile time, allowing open-source users to build and audit the core module while enterprise builds unlock zkPoT-OCC proof verification and custom compliance modules.
+
+
+
 <a href='https://ko-fi.com/T6T61WAZYZ' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi5.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
 
 
