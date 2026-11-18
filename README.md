@@ -1,3 +1,10 @@
+🛡️ Authority Badges (Markdown)
+![Authority Status](https://img.shields.io/badge/Authority-ACTIVE-success?style=for-the-badge&logo=opsgenie&logoColor=white)
+![Compliance](https://img.shields.io/badge/Compliance-FINCEN%20Standard-blue?style=for-the-badge&logo=legalone&logoColor=white)
+![Identity](https://img.shields.io/badge/Identity-VERIFIED%20R.D.K.-orange?style=for-the-badge&logo=id.me&logoColor=white)
+![Governance](https://img.shields.io/badge/Governance-GITDIGITAL%20LLC-004a99?style=for-the-badge&logo=git&logoColor=white)
+![Tax Status](https://img.shields.io/badge/Tax%20Logic-2026%20READY-red?style=for-the-badge&logo=quickbooks&logoColor=white)
+
 
 [![GitDigital Authorized](https://img.shields.io/badge/GitDigital-Authorized-9945FF?style=for-the-badge&logo=github)](https://github.com/Gitdigital-products)
 
