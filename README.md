@@ -1,3 +1,13 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/Authority-ACTIVE-success?style=for-the-badge&logo=opsgenie&logoColor=white" />
+  <img src="https://img.shields.io/badge/Compliance-FINCEN%20Standard-blue?style=for-the-badge&logo=legalone&logoColor=white" />
+  <img src="https://img.shields.io/badge/Identity-VERIFIED%20R.D.K.-orange?style=for-the-badge&logo=id.me&logoColor=white" />
+</p>
+
+
+
+
+
 🛡️ Authority Badges (Markdown)
 ![Authority Status](https://img.shields.io/badge/Authority-ACTIVE-success?style=for-the-badge&logo=opsgenie&logoColor=white)
 ![Compliance](https://img.shields.io/badge/Compliance-FINCEN%20Standard-blue?style=for-the-badge&logo=legalone&logoColor=white)
